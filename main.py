@@ -2,11 +2,19 @@ import cv2
 import numpy as np
 import face_recognition
 import os
+import json
+import csv
+from datetime import datetime
+from urllib import error, request
 
 #Load image
 path='images'
 images=[]
 classNames=[]
+backendBaseUrl = os.getenv('BACKEND_URL', 'http://127.0.0.1:8000')
+markedToday = set()
+backendUnavailableLogged = False
+backendAvailableAtStartup = False
 
 myList=os.listdir(path)
 
@@ -29,30 +37,78 @@ print("Encoding Complete")
 
 #Start webcam
 cap=cv2.VideoCapture(0)
-from datetime import datetime
 
-import csv
-from datetime import datetime
 
-def markAttendance(name):
-    now=datetime.now()
-    date=now.strftime('%Y-%m-%d')
-    time=now.strftime('%H:%M:%S')
+def markAttendanceLocal(name):
+    now = datetime.now()
+    date = now.strftime('%Y-%m-%d')
+    time = now.strftime('%H:%M:%S')
 
-    with open('attendance.csv','r+') as f:
-        reader=csv.reader(f)
-        data=list(reader)
-
-        already_marked=False
-
-        for row in data:
-            if len(row)>0 and row[0] == name and row[1]==date:
-                already_marked = True
+    alreadyMarked = False
+    with open('attendance.csv', 'r', newline='') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) > 1 and row[0] == name and row[1] == date:
+                alreadyMarked = True
                 break
 
-        if not already_marked:
+    if not alreadyMarked:
+        with open('attendance.csv', 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([name, date, time])
+
+
+def markAttendanceBackend(name):
+    payload = json.dumps({"name": name}).encode('utf-8')
+    req = request.Request(
+        f'{backendBaseUrl}/attendance/mark',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+
+    with request.urlopen(req, timeout=2.0) as response:
+        body = response.read().decode('utf-8')
+        return json.loads(body)
+
+
+def checkBackendHealth():
+    req = request.Request(f'{backendBaseUrl}/health', method='GET')
+    with request.urlopen(req, timeout=2.0) as response:
+        body = response.read().decode('utf-8')
+        data = json.loads(body)
+        return data.get('status') == 'ok'
+
+def markAttendance(name):
+    global backendUnavailableLogged
+
+    date = datetime.now().strftime('%Y-%m-%d')
+    cacheKey = f'{name}:{date}'
+    if cacheKey in markedToday:
+        return
+
+    try:
+        result = markAttendanceBackend(name)
+        if result.get('message') in ('Attendance marked', 'Already marked'):
+            markedToday.add(cacheKey)
+    except (error.URLError, TimeoutError, json.JSONDecodeError):
+        # Fallback keeps recognition usable even when the API is down.
+        if not backendUnavailableLogged:
+            print('Backend unavailable, writing attendance to local CSV fallback.')
+            backendUnavailableLogged = True
+        markAttendanceLocal(name)
+        markedToday.add(cacheKey)
+
+
+try:
+    backendAvailableAtStartup = checkBackendHealth()
+except (error.URLError, TimeoutError, json.JSONDecodeError):
+    backendAvailableAtStartup = False
+
+if backendAvailableAtStartup:
+    print(f'Backend connected at {backendBaseUrl}. Attendance will be marked via API.')
+else:
+    print(f'Backend offline at {backendBaseUrl}. Attendance will use local CSV fallback.')
             
 while True:
     success, img = cap.read()
